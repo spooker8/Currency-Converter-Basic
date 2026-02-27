@@ -19,7 +19,10 @@ Gmail users: create an App Password at
 and put that 16-char code in sender_password (not your real Gmail password).
 """
 
+import html as html_mod
 import json
+import os
+import tempfile
 import time
 import smtplib
 import logging
@@ -28,6 +31,7 @@ from datetime import datetime
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from pathlib import Path
+from urllib.parse import urlencode
 
 from playwright.sync_api import sync_playwright, TimeoutError as PWTimeout
 
@@ -57,16 +61,35 @@ def load_config() -> dict:
         return json.load(f)
 
 
+MAX_SEEN = 10_000   # cap to avoid unbounded growth
+
+
 def load_seen() -> set:
     if SEEN_FILE.exists():
-        with open(SEEN_FILE, "r") as f:
-            return set(json.load(f))
+        try:
+            with open(SEEN_FILE, "r") as f:
+                return set(json.load(f))
+        except (json.JSONDecodeError, ValueError):
+            log.warning("Seen-items file was corrupted — starting fresh.")
+            SEEN_FILE.unlink(missing_ok=True)
     return set()
 
 
 def save_seen(seen: set) -> None:
-    with open(SEEN_FILE, "w") as f:
-        json.dump(list(seen), f)
+    # Trim to the most-recent MAX_SEEN entries (sets are unordered so we just slice)
+    items = list(seen)
+    if len(items) > MAX_SEEN:
+        items = items[-MAX_SEEN:]
+
+    # Atomic write: write to a temp file then rename so a crash never corrupts the file
+    fd, tmp_path = tempfile.mkstemp(dir=SEEN_FILE.parent, prefix=".seen_tmp_")
+    try:
+        with os.fdopen(fd, "w") as f:
+            json.dump(items, f)
+        os.replace(tmp_path, SEEN_FILE)
+    except Exception:
+        os.unlink(tmp_path)
+        raise
 
 
 # ---------------------------------------------------------------------------
@@ -104,6 +127,9 @@ def _extract_items_from_api_json(body: dict) -> list[dict]:
     return items
 
 
+_CURRENCY_SYMBOL = {"EUR": "€", "USD": "$", "GBP": "£", "MXN": "$", "ARS": "$"}
+
+
 def _normalise(item: dict) -> dict | None:
     """Turn a raw Wallapop item dict into the fields we care about."""
     try:
@@ -113,7 +139,8 @@ def _normalise(item: dict) -> dict | None:
         title    = item.get("title", "No title")
         price_d  = item.get("price") or {}
         amount   = price_d.get("amount", "?")
-        currency = price_d.get("currency", "€")
+        currency_code = price_d.get("currency", "EUR")
+        symbol   = _CURRENCY_SYMBOL.get(currency_code, currency_code)
         slug     = item.get("web_slug") or item.get("webSlug") or item_id
         url      = f"{ITEM_BASE}{slug}"
         desc     = (item.get("description") or "")[:300]
@@ -125,7 +152,7 @@ def _normalise(item: dict) -> dict | None:
         return {
             "id":       item_id,
             "title":    title,
-            "price":    f"{amount} {currency}",
+            "price":    f"{amount} {symbol}",
             "url":      url,
             "desc":     desc,
             "location": location,
@@ -183,12 +210,8 @@ def search_wallapop(keyword: str, config: dict, browser) -> list[dict]:
     wconf   = config.get("wallapop", {})
     max_res = wconf.get("max_results_per_keyword", 40)
 
-    params  = (
-        f"?keywords={keyword.replace(' ', '+')}"
-        f"&order_by=newest"
-        f"&step={max_res}"
-    )
-    target_url = SEARCH_URL + params
+    qs = urlencode({"keywords": keyword, "order_by": "newest", "step": max_res})
+    target_url = f"{SEARCH_URL}?{qs}"
 
     captured: list[dict] = []
     capture_done = threading.Event()
@@ -223,17 +246,21 @@ def search_wallapop(keyword: str, config: dict, browser) -> list[dict]:
         log.info("  Loading Wallapop search for '%s'…", keyword)
         page.goto(target_url, timeout=40_000, wait_until="domcontentloaded")
 
-        # Wait up to 15 s for the API response to arrive
+        # Wait up to 15 s for the API response to arrive after DOM load
         capture_done.wait(timeout=15)
 
         if not captured:
             # Fallback: parse the DOM directly
             log.info("  API interception got nothing — trying DOM parse…")
-            page.wait_for_timeout(5000)
+            page.wait_for_timeout(3000)
             captured.extend(_extract_items_from_dom(page))
 
     except PWTimeout:
-        log.warning("  Page load timed out for keyword '%s'", keyword)
+        log.warning("  Page load timed out for keyword '%s' — trying DOM parse anyway", keyword)
+        try:
+            captured.extend(_extract_items_from_dom(page))
+        except Exception:
+            pass
     except Exception as exc:
         log.warning("  Error loading page for '%s': %s", keyword, exc)
     finally:
@@ -250,25 +277,38 @@ def search_wallapop(keyword: str, config: dict, browser) -> list[dict]:
 # Email
 # ---------------------------------------------------------------------------
 
+def _h(text: str) -> str:
+    """Escape a string for safe insertion into HTML."""
+    return html_mod.escape(str(text), quote=True)
+
+
 def _item_html(item: dict) -> str:
     img_tag = (
-        f'<img src="{item["image"]}" width="120" '
+        f'<img src="{_h(item["image"])}" width="120" '
         f'style="float:left;margin:0 12px 8px 0;border-radius:4px;" />'
         if item["image"] else ""
+    )
+    location_span = (
+        f"&nbsp;&nbsp;<span style='color:#888;font-size:13px;'>📍 {_h(item['location'])}</span>"
+        if item["location"] else ""
+    )
+    desc_span = (
+        f"<span style='color:#555;font-size:13px;'>{_h(item['desc'])}</span><br>"
+        if item["desc"] else ""
     )
     return f"""
     <tr>
       <td style="padding:14px 10px;border-bottom:1px solid #eee;overflow:hidden;">
         {img_tag}
-        <a href="{item['url']}"
+        <a href="{_h(item['url'])}"
            style="font-size:16px;font-weight:bold;color:#1a73e8;text-decoration:none;">
-          {item['title']}
+          {_h(item['title'])}
         </a><br>
-        <span style="color:#e53935;font-size:15px;font-weight:bold;">{item['price']}</span>
-        {"&nbsp;&nbsp;<span style='color:#888;font-size:13px;'>📍 " + item['location'] + "</span>" if item['location'] else ""}
+        <span style="color:#e53935;font-size:15px;font-weight:bold;">{_h(item['price'])}</span>
+        {location_span}
         <br>
-        {"<span style='color:#555;font-size:13px;'>" + item['desc'] + "</span><br>" if item['desc'] else ""}
-        <a href="{item['url']}"
+        {desc_span}
+        <a href="{_h(item['url'])}"
            style="font-size:13px;color:#1a73e8;">View on Wallapop →</a>
         <div style="clear:both;"></div>
       </td>
@@ -317,8 +357,28 @@ def send_email(keyword: str, new_items: list[dict], config: dict) -> None:
 # Main loop
 # ---------------------------------------------------------------------------
 
+def validate_config(config: dict) -> None:
+    """Raise a clear error if required config keys are missing."""
+    required = {
+        "keywords": list,
+        "email": dict,
+    }
+    for key, typ in required.items():
+        if key not in config:
+            raise KeyError(f"config.json is missing required key: '{key}'")
+        if not isinstance(config[key], typ):
+            raise TypeError(f"config.json '{key}' must be a {typ.__name__}")
+    email_keys = ["smtp_host", "smtp_port", "sender_email", "sender_password", "recipient_email"]
+    for k in email_keys:
+        if k not in config["email"]:
+            raise KeyError(f"config.json is missing email.{k}")
+    if not config["keywords"]:
+        raise ValueError("config.json 'keywords' list must not be empty")
+
+
 def check_once(config: dict, seen: set, browser) -> set:
-    for keyword in config["keywords"]:
+    keywords = [kw for kw in config["keywords"] if kw and kw.strip()]
+    for keyword in keywords:
         log.info("Checking keyword: '%s'", keyword)
         items = search_wallapop(keyword, config, browser)
 
@@ -335,9 +395,19 @@ def check_once(config: dict, seen: set, browser) -> set:
     return seen
 
 
+def _launch_browser(pw):
+    return pw.firefox.launch(headless=True)
+
+
 def main() -> None:
-    config   = load_config()
-    interval = config.get("check_interval_minutes", 5) * 60
+    config = load_config()
+    try:
+        validate_config(config)
+    except (KeyError, TypeError, ValueError) as exc:
+        print(f"ERROR: {exc}")
+        raise SystemExit(1)
+
+    interval = max(1, config.get("check_interval_minutes", 5)) * 60
     seen     = load_seen()
 
     log.info("=" * 55)
@@ -348,8 +418,7 @@ def main() -> None:
     log.info("=" * 55)
 
     with sync_playwright() as pw:
-        # Launch Firefox once; reuse it across all checks
-        browser = pw.firefox.launch(headless=True)
+        browser = _launch_browser(pw)
         try:
             while True:
                 try:
@@ -359,13 +428,23 @@ def main() -> None:
                     raise
                 except Exception as exc:
                     log.error("Unexpected error during check: %s", exc)
+                    # If the browser crashed, relaunch it for the next round
+                    try:
+                        browser.close()
+                    except Exception:
+                        pass
+                    log.info("Relaunching browser after error…")
+                    browser = _launch_browser(pw)
 
                 log.info("Sleeping %d minutes…", interval // 60)
                 time.sleep(interval)
         except KeyboardInterrupt:
             log.info("Stopped by user.")
         finally:
-            browser.close()
+            try:
+                browser.close()
+            except Exception:
+                pass
 
 
 if __name__ == "__main__":
